@@ -6,7 +6,7 @@ pytest_tests:
   image: python:3.10
   script:
     - pip install -r requirements.txt
-    - pytest -vvsrA --junitxml=report.xml
+    - pytest -vvrA --junitxml=report.xml
   artifacts:
     when: always
     paths:
