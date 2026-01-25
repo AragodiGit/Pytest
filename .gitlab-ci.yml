@@ -1,0 +1,13 @@
+stages:
+  - test
+
+pytest_tests:
+  stage: test
+  image: python:3.10
+  script:
+    - pip install -r requirements.txt
+    - pytest -vvrA --junitxml=report.xml
+  artifacts:
+    when: always
+    paths:
+      - report.xml
