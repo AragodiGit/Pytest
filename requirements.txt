@@ -1,0 +1,26 @@
+# ── Core test framework ──────────────────────────────────────────────
+pytest==7.4.4
+pytest-html==4.1.1
+pytest-timeout==2.2.0
+pytest-mock==3.12.0
+behave==1.2.6
+
+# ── Automotive / HIL integration ─────────────────────────────────────
+pywin32==306            # CANoe COM API (Windows HIL bench only)
+pythonnet==3.0.3        # dSPACE XIL API (.NET bridge)
+
+# ── Data processing & reporting ──────────────────────────────────────
+pandas==2.1.4
+openpyxl==3.1.2
+numpy==1.26.3
+
+# ── Jira Xray API ────────────────────────────────────────────────────
+requests==2.31.0
+
+# ── Code quality ─────────────────────────────────────────────────────
+flake8==7.0.0
+black==24.1.1
+mypy==1.8.0
+
+# ── Utilities ────────────────────────────────────────────────────────
+python-dotenv==1.0.1    # Load .env for local dev

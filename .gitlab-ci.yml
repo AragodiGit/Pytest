@@ -1,0 +1,239 @@
+# ============================================================
+# .gitlab-ci.yml
+# Automotive ECU Test Automation — GitLab CI/CD Pipeline
+#
+# Stages:
+#   lint       → code quality checks (no hardware needed)
+#   unit       → mock-based unit tests (no hardware needed)
+#   regression → full HIL test run (hardware runner, scheduled)
+#   report     → generate Excel + upload to Jira Xray
+#   notify     → Slack alert on failure
+#
+# Author: Rakesh Aragodi
+# ============================================================
+
+image: python:3.11-slim
+
+variables:
+  PIP_CACHE_DIR:    "$CI_PROJECT_DIR/.cache/pip"
+  REPORTS_DIR:      "reports"
+  JUNIT_XML:        "reports/results.xml"
+  BEHAVE_JUNIT_XML: "reports/TESTS-features.xml"
+
+cache:
+  paths:
+    - .cache/pip
+    - venv/
+
+stages:
+  - lint
+  - unit
+  - regression
+  - report
+  - notify
+
+# ── Reusable setup ──────────────────────────────────────────────────
+.setup_python: &setup_python
+  before_script:
+    - python -m venv venv
+    - source venv/bin/activate
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+
+# ════════════════════════════════════════════════════════════════════
+# Stage 1 — Lint (every push)
+# ════════════════════════════════════════════════════════════════════
+
+lint:flake8:
+  stage: lint
+  <<: *setup_python
+  script:
+    - flake8 utils/ tests/ steps/ --max-line-length=110 --exclude=__pycache__
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+
+lint:black:
+  stage: lint
+  <<: *setup_python
+  script:
+    - black --check utils/ tests/ steps/ --line-length=110
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+
+lint:mypy:
+  stage: lint
+  <<: *setup_python
+  script:
+    - mypy utils/ --ignore-missing-imports --no-strict-optional
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+  allow_failure: true   # type hints are best-effort on this project
+
+# ════════════════════════════════════════════════════════════════════
+# Stage 2 — Unit tests (no hardware, mock-based)
+# ════════════════════════════════════════════════════════════════════
+
+unit:pytest:
+  stage: unit
+  <<: *setup_python
+  script:
+    - mkdir -p $REPORTS_DIR
+    - pytest tests/
+        -m "not regression and not fault_injection"
+        --junitxml=$JUNIT_XML
+        --tb=short
+        -v
+  artifacts:
+    when: always
+    paths:
+      - $REPORTS_DIR/
+    reports:
+      junit: $JUNIT_XML
+    expire_in: 7 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+
+# ════════════════════════════════════════════════════════════════════
+# Stage 3 — Full HIL regression (hardware runner, scheduled nightly)
+# ════════════════════════════════════════════════════════════════════
+
+regression:pytest:bcm:
+  stage: regression
+  tags:
+    - hil-runner      # GitLab runner on the HIL bench (Windows, CANoe installed)
+  <<: *setup_python
+  script:
+    - mkdir -p $REPORTS_DIR
+    - echo "Running BCM regression suite..."
+    - pytest tests/bcm/
+        -m regression
+        --junitxml=$REPORTS_DIR/bcm_results.xml
+        --tb=long
+        -v
+        --log-cli-level=INFO
+  artifacts:
+    when: always
+    paths:
+      - $REPORTS_DIR/
+      - "*.log"
+    reports:
+      junit: $REPORTS_DIR/bcm_results.xml
+    expire_in: 30 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  timeout: 2h
+
+regression:pytest:uds:
+  stage: regression
+  tags:
+    - hil-runner
+  <<: *setup_python
+  script:
+    - mkdir -p $REPORTS_DIR
+    - echo "Running UDS diagnostic regression suite..."
+    - pytest tests/uds/
+        -m regression
+        --junitxml=$REPORTS_DIR/uds_results.xml
+        --tb=long
+        -v
+        --log-cli-level=INFO
+  artifacts:
+    when: always
+    paths:
+      - $REPORTS_DIR/
+    reports:
+      junit: $REPORTS_DIR/uds_results.xml
+    expire_in: 30 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  timeout: 1h
+
+regression:behave:bdd:
+  stage: regression
+  tags:
+    - hil-runner
+  <<: *setup_python
+  script:
+    - mkdir -p $REPORTS_DIR
+    - echo "Running BDD feature scenarios..."
+    - behave features/
+        --junit
+        --junit-directory=$REPORTS_DIR
+        --tags=@regression
+        --no-capture
+        --format=progress2
+  artifacts:
+    when: always
+    paths:
+      - $REPORTS_DIR/
+    reports:
+      junit: $BEHAVE_JUNIT_XML
+    expire_in: 30 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  timeout: 3h
+
+# ════════════════════════════════════════════════════════════════════
+# Stage 4 — Report generation + Xray upload
+# ════════════════════════════════════════════════════════════════════
+
+report:excel_and_xray:
+  stage: report
+  <<: *setup_python
+  dependencies:
+    - regression:pytest:bcm
+    - regression:pytest:uds
+    - regression:behave:bdd
+  script:
+    - echo "Generating Excel report and uploading to Jira Xray..."
+    - python -c "
+from utils.xray_client import XrayClient
+import os, glob
+
+client = XrayClient()
+xml_files = glob.glob('reports/*.xml')
+for xml_file in xml_files:
+    try:
+        key = client.upload_junit_xml(
+            xml_path=xml_file,
+            plan_key=os.getenv('JIRA_PLAN_KEY', 'BCM-50'),
+            summary=f'CI Nightly Regression — {os.getenv(\"CI_PIPELINE_ID\", \"local\")}',
+        )
+        print(f'Uploaded {xml_file} -> Xray execution {key}')
+    except Exception as e:
+        print(f'Warning: Xray upload failed for {xml_file}: {e}')
+"
+  artifacts:
+    when: always
+    paths:
+      - $REPORTS_DIR/
+    expire_in: 90 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  allow_failure: true   # Xray upload failure should not block the pipeline
+
+# ════════════════════════════════════════════════════════════════════
+# Stage 5 — Slack notification on failure
+# ════════════════════════════════════════════════════════════════════
+
+notify:slack_on_failure:
+  stage: notify
+  image: curlimages/curl:latest
+  script:
+    - |
+      curl -s -X POST "$SLACK_WEBHOOK_URL" \
+        -H "Content-type: application/json" \
+        -d "{
+          \"text\": \"❌ *Automotive ECU Regression FAILED*\",
+          \"attachments\": [{
+            \"color\": \"danger\",
+            \"fields\": [
+              {\"title\": \"Pipeline\", \"value\": \"$CI_PIPELINE_URL\", \"short\": false},
+              {\"title\": \"Branch\",   \"value\": \"$CI_COMMIT_REF_NAME\", \"short\": true},
+              {\"title\": \"Triggered\", \"value\": \"$CI_PIPELINE_SOURCE\", \"short\": true}
+            ]
+          }]
+        }"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: on_failure
